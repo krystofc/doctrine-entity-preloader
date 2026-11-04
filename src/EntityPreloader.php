@@ -3,11 +3,15 @@
 namespace ShipMonk\DoctrineEntityPreloader;
 
 use ArrayAccess;
+use BackedEnum;
+use Closure;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\ParameterType;
 use Doctrine\DBAL\Types\Type;
+use Doctrine\DBAL\Types\Types;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Mapping\ClassMetadata;
+use Doctrine\ORM\Mapping\JoinColumnMapping;
 use Doctrine\ORM\Mapping\PropertyAccessors\PropertyAccessor;
 use Doctrine\ORM\PersistentCollection;
 use Doctrine\ORM\QueryBuilder;
@@ -17,6 +21,7 @@ use function array_chunk;
 use function array_values;
 use function count;
 use function get_parent_class;
+use function in_array;
 use function is_a;
 use function method_exists;
 
@@ -25,6 +30,19 @@ class EntityPreloader
 
     private const PRELOAD_ENTITY_DEFAULT_BATCH_SIZE = 1_000;
     private const PRELOAD_COLLECTION_DEFAULT_BATCH_SIZE = 100;
+
+    /**
+     * Types whose PHP value equals the raw database value Doctrine uses as indexBy key
+     */
+    private const INDEX_BY_SUPPORTED_TYPES = [
+        Types::INTEGER,
+        Types::SMALLINT,
+        Types::BIGINT,
+        Types::STRING,
+        Types::ASCII_STRING,
+        Types::TEXT,
+        Types::GUID,
+    ];
 
     public function __construct(
         private EntityManagerInterface $entityManager,
@@ -58,20 +76,133 @@ class EntityPreloader
         /** @var ClassMetadata<object> $targetClassMetadata */
         $targetClassMetadata = $this->entityManager->getClassMetadata($associationMapping['targetEntity']);
 
-        if (isset($associationMapping['indexBy'])) {
-            throw new LogicException('Preloading of indexed associations is not supported');
-        }
+        $indexKeyResolver = isset($associationMapping['indexBy'])
+            ? $this->createIndexKeyResolver($sourceClassMetadata, $sourcePropertyName, $targetClassMetadata, $associationMapping['indexBy'])
+            : null;
 
         $maxFetchJoinSameFieldCount ??= 1;
         $sourceEntities = $this->loadProxies($sourceClassMetadata, $sourceEntities, $batchSize ?? self::PRELOAD_ENTITY_DEFAULT_BATCH_SIZE, $maxFetchJoinSameFieldCount);
 
-        $preloader = match ($associationMapping['type']) {
-            ClassMetadata::ONE_TO_ONE, ClassMetadata::MANY_TO_ONE => $this->preloadToOne(...),
-            ClassMetadata::ONE_TO_MANY, ClassMetadata::MANY_TO_MANY => $this->preloadToMany(...),
+        return match ($associationMapping['type']) {
+            ClassMetadata::ONE_TO_ONE, ClassMetadata::MANY_TO_ONE => $this->preloadToOne($sourceEntities, $sourceClassMetadata, $sourcePropertyName, $targetClassMetadata, $batchSize, $maxFetchJoinSameFieldCount),
+            ClassMetadata::ONE_TO_MANY, ClassMetadata::MANY_TO_MANY => $this->preloadToMany($sourceEntities, $sourceClassMetadata, $sourcePropertyName, $targetClassMetadata, $batchSize, $maxFetchJoinSameFieldCount, $indexKeyResolver),
             default => throw new LogicException("Unsupported association mapping type {$associationMapping['type']}"),
         };
+    }
 
-        return $preloader($sourceEntities, $sourceClassMetadata, $sourcePropertyName, $targetClassMetadata, $batchSize, $maxFetchJoinSameFieldCount);
+    /**
+     * Mimics the key Doctrine uses when hydrating indexed collection (raw database value of indexBy column)
+     * without querying it, so only types whose PHP value equals the database value are supported.
+     *
+     * @param ClassMetadata<object> $sourceClassMetadata
+     * @param ClassMetadata<object> $targetClassMetadata
+     * @return Closure(object): mixed
+     */
+    private function createIndexKeyResolver(
+        ClassMetadata $sourceClassMetadata,
+        string $sourcePropertyName,
+        ClassMetadata $targetClassMetadata,
+        string $indexBy,
+    ): Closure
+    {
+        $associationDescription = "'{$sourceClassMetadata->getName()}::\${$sourcePropertyName}'";
+
+        if ($targetClassMetadata->hasField($indexBy)) {
+            $this->checkIndexByFieldType($associationDescription, $indexBy, $targetClassMetadata, $indexBy);
+            $indexByAccessor = $this->getPropertyAccessor($targetClassMetadata, $indexBy); // e.g. Item::$code reflection
+
+            if ($indexByAccessor === null) {
+                throw new LogicException('Doctrine should use RuntimeReflectionService which never returns null.');
+            }
+
+            return static fn (object $targetEntity): mixed => self::toIndexKey($indexByAccessor->getValue($targetEntity));
+        }
+
+        foreach ($targetClassMetadata->getAssociationMappings() as $associationName => $associationMapping) {
+            $isToOneOwningSide = ($associationMapping['type'] & ClassMetadata::TO_ONE) !== 0 && $associationMapping['isOwningSide'] === true;
+
+            if (!$isToOneOwningSide) {
+                continue;
+            }
+
+            foreach ($associationMapping['joinColumns'] ?? [] as $joinColumn) {
+                [$joinColumnName, $referencedColumnName] = $joinColumn instanceof JoinColumnMapping // ORM 3 deprecates ArrayAccess on JoinColumnMapping, ORM 2 uses arrays
+                    ? [$joinColumn->name, $joinColumn->referencedColumnName]
+                    : [$joinColumn['name'], $joinColumn['referencedColumnName']];
+
+                if ($joinColumnName !== $indexBy) {
+                    continue;
+                }
+
+                /** @var ClassMetadata<object> $referencedClassMetadata */
+                $referencedClassMetadata = $this->entityManager->getClassMetadata($associationMapping['targetEntity']);
+                $referencedFieldName = $referencedClassMetadata->getFieldForColumn($referencedColumnName); // e.g. 'id'
+
+                if (!$referencedClassMetadata->hasField($referencedFieldName)) {
+                    throw new LogicException("Preloading of association {$associationDescription} indexed by '{$indexBy}' is not supported, the join column references an association of '{$referencedClassMetadata->getName()}'");
+                }
+
+                $this->checkIndexByFieldType($associationDescription, $indexBy, $referencedClassMetadata, $referencedFieldName);
+                $referencedEntityAccessor = $this->getPropertyAccessor($targetClassMetadata, $associationName); // e.g. Item::$category reflection
+                $unitOfWork = $this->entityManager->getUnitOfWork();
+
+                if ($referencedEntityAccessor === null) {
+                    throw new LogicException('Doctrine should use RuntimeReflectionService which never returns null.');
+                }
+
+                return static function (object $targetEntity) use ($referencedEntityAccessor, $referencedFieldName, $unitOfWork): mixed {
+                    $referencedEntity = $referencedEntityAccessor->getValue($targetEntity);
+
+                    if ($referencedEntity === null) {
+                        return null;
+                    }
+
+                    return self::toIndexKey($unitOfWork->getEntityIdentifier($referencedEntity)[$referencedFieldName]); // works for uninitialized proxies too
+                };
+            }
+        }
+
+        throw new LogicException("Preloading of association {$associationDescription} is not possible, indexBy '{$indexBy}' is neither a field nor a join column of '{$targetClassMetadata->getName()}'");
+    }
+
+    /**
+     * @param ClassMetadata<object> $classMetadata
+     */
+    private function checkIndexByFieldType(
+        string $associationDescription,
+        string $indexBy,
+        ClassMetadata $classMetadata,
+        string $fieldName,
+    ): void
+    {
+        $typeName = $classMetadata->getTypeOfField($fieldName);
+
+        if (!in_array($typeName, self::INDEX_BY_SUPPORTED_TYPES, true)) {
+            $typeDescription = $typeName ?? 'unknown';
+            throw new LogicException("Preloading of association {$associationDescription} indexed by '{$indexBy}' of type '{$typeDescription}' is not supported, only integer and string types (and backed enums) are supported");
+        }
+    }
+
+    private static function toIndexKey(mixed $value): mixed
+    {
+        return $value instanceof BackedEnum ? $value->value : $value;
+    }
+
+    /**
+     * @param PersistentCollection<array-key, object> $collection
+     * @param (Closure(object): mixed)|null $indexKeyResolver
+     */
+    private function addToCollection(
+        PersistentCollection $collection,
+        object $targetEntity,
+        ?Closure $indexKeyResolver,
+    ): void
+    {
+        if ($indexKeyResolver === null) {
+            $collection->add($targetEntity);
+        } else {
+            $collection->hydrateSet($indexKeyResolver($targetEntity), $targetEntity);
+        }
     }
 
     /**
@@ -149,6 +280,7 @@ class EntityPreloader
      * @param ClassMetadata<object> $targetClassMetadata
      * @param positive-int|null $batchSize
      * @param non-negative-int $maxFetchJoinSameFieldCount
+     * @param (Closure(object): mixed)|null $indexKeyResolver
      * @return list<object>
      */
     private function preloadToMany(
@@ -158,6 +290,7 @@ class EntityPreloader
         ClassMetadata $targetClassMetadata,
         ?int $batchSize,
         int $maxFetchJoinSameFieldCount,
+        ?Closure $indexKeyResolver,
     ): array
     {
         $sourceIdentifierAccessor = $this->getSingleIdPropertyAccessor($sourceClassMetadata); // e.g. Order::$id reflection
@@ -209,6 +342,7 @@ class EntityPreloader
                     uninitializedSourceEntityIdsChunk: array_values($uninitializedSourceEntityIdsChunk),
                     uninitializedCollections: $uninitializedCollections,
                     maxFetchJoinSameFieldCount: $maxFetchJoinSameFieldCount,
+                    indexKeyResolver: $indexKeyResolver,
                 ),
                 ClassMetadata::MANY_TO_MANY => $this->preloadManyToManyInner(
                     associationMapping: $associationMapping,
@@ -219,6 +353,7 @@ class EntityPreloader
                     uninitializedSourceEntityIdsChunk: array_values($uninitializedSourceEntityIdsChunk),
                     uninitializedCollections: $uninitializedCollections,
                     maxFetchJoinSameFieldCount: $maxFetchJoinSameFieldCount,
+                    indexKeyResolver: $indexKeyResolver,
                 ),
                 default => throw new LogicException('Unsupported association mapping type'),
             };
@@ -241,8 +376,9 @@ class EntityPreloader
      * @param ClassMetadata<object> $sourceClassMetadata
      * @param ClassMetadata<object> $targetClassMetadata
      * @param list<mixed> $uninitializedSourceEntityIdsChunk
-     * @param array<string, PersistentCollection<int, object>> $uninitializedCollections
+     * @param array<string, PersistentCollection<array-key, object>> $uninitializedCollections
      * @param non-negative-int $maxFetchJoinSameFieldCount
+     * @param (Closure(object): mixed)|null $indexKeyResolver
      * @return array<string, object>
      */
     private function preloadOneToManyInner(
@@ -255,6 +391,7 @@ class EntityPreloader
         array $uninitializedSourceEntityIdsChunk,
         array $uninitializedCollections,
         int $maxFetchJoinSameFieldCount,
+        ?Closure $indexKeyResolver,
     ): array
     {
         $targetPropertyName = $sourceClassMetadata->getAssociationMappedByTargetField($sourcePropertyName); // e.g. 'order'
@@ -277,7 +414,7 @@ class EntityPreloader
         foreach ($targetEntitiesList as $targetEntity) {
             $sourceEntity = $targetPropertyAccessor->getValue($targetEntity);
             $sourceEntityKey = (string) $sourceIdentifierAccessor->getValue($sourceEntity);
-            $uninitializedCollections[$sourceEntityKey]->add($targetEntity);
+            $this->addToCollection($uninitializedCollections[$sourceEntityKey], $targetEntity, $indexKeyResolver);
 
             $targetEntityKey = (string) $targetIdentifierAccessor->getValue($targetEntity);
             $targetEntities[$targetEntityKey] = $targetEntity;
@@ -291,8 +428,9 @@ class EntityPreloader
      * @param ClassMetadata<object> $sourceClassMetadata
      * @param ClassMetadata<object> $targetClassMetadata
      * @param list<mixed> $uninitializedSourceEntityIdsChunk
-     * @param array<string, PersistentCollection<int, object>> $uninitializedCollections
+     * @param array<string, PersistentCollection<array-key, object>> $uninitializedCollections
      * @param non-negative-int $maxFetchJoinSameFieldCount
+     * @param (Closure(object): mixed)|null $indexKeyResolver
      * @return array<string, object>
      */
     private function preloadManyToManyInner(
@@ -304,6 +442,7 @@ class EntityPreloader
         array $uninitializedSourceEntityIdsChunk,
         array $uninitializedCollections,
         int $maxFetchJoinSameFieldCount,
+        ?Closure $indexKeyResolver,
     ): array
     {
         if (count($associationMapping['orderBy'] ?? []) > 0) {
@@ -356,7 +495,7 @@ class EntityPreloader
         foreach ($manyToManyRows as $manyToManyRow) {
             $sourceEntityKey = (string) $manyToManyRow['sourceId'];
             $targetEntityKey = (string) $manyToManyRow['targetId'];
-            $uninitializedCollections[$sourceEntityKey]->add($targetEntities[$targetEntityKey]);
+            $this->addToCollection($uninitializedCollections[$sourceEntityKey], $targetEntities[$targetEntityKey], $indexKeyResolver);
         }
 
         return $targetEntities;
