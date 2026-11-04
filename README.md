@@ -114,6 +114,10 @@ $preloader->preload(
 
 ## Limitations
 
-- no support for indexed collections
+- indexed collections (`indexBy`) are supported only when indexed by:
+    - a field of integer or string type (`integer`, `smallint`, `bigint`, `string`, `ascii_string`, `text`, `guid`), including backed enums
+    - a join column of a to-one association (e.g. `indexBy: 'author_id'`) referencing such field
+    - other `indexBy` values throw `LogicException`
+    - keys are taken from the in-memory entity, so unflushed changes of the indexed field may produce different keys than Doctrine (which uses the database value)
 - no support for dirty collections
 - no support for composite primary keys
